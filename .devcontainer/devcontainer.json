@@ -1,0 +1,31 @@
+{
+  "name": "Python (PyPy)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "VARIANT": "3.10-7.3.16-slim-bullseye" // Debian Buster based image
+    }
+  },
+  "customizations": {
+      "vscode": {
+          "extensions": [
+            "ms-python.python",
+            "ms-toolsai.jupyter",
+            "ms-azuretools.vscode-docker",
+            "ms-python.python-debug",
+            "ms-python.autopep8",
+            "randomfractalsinc.vscode-data-wrangler",
+            "donjayamanne.python-extension-pack",
+            "maptz.regionfolder"
+          ],
+          "settings": {
+            "python.defaultInterpreterPath": "/opt/pypy/bin/pypy3.10",
+            "python.formatting.provider": "autopep8",
+            "python.languageServer": "Jedi"
+          }
+      }
+  },
+  "workspaceFolder": "/home/csandfort/workspace", // Updated workspaceFolder
+  "remoteUser": "csandfort", // Updated remoteUser
+  "mounts": ["source=${localWorkspaceFolder},target=/home/csandfort/workspace,type=bind,consistency=cached"]
+}
