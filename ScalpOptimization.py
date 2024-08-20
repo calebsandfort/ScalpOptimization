@@ -1,3 +1,4 @@
+import time
 import random
 import pandas as pd
 import numpy as np
@@ -14,17 +15,21 @@ import scipy.stats.mstats  # For winsorization
 import matplotlib.pyplot as plt       # For plotting charts
 # For displaying HTML content (if using Jupyter Notebook)
 from IPython.display import HTML
-import tqdm
+from tqdm import tqdm
 
 import os
 from datetime import datetime
 from matplotlib.backends.backend_pdf import PdfPages
 from tabulate import tabulate
+from joblib import Parallel, delayed
+import hashlib
+import json
 
-events_df = pd.read_csv("events.csv")
+events_df = pd.read_csv("events.csv", header=None)
 events = events_df.values
 
 probabilities = events[:, 0]
+probabilities = probabilities / probabilities.sum()
 
 account_details = {
     "Rally": {
@@ -153,7 +158,7 @@ def simulatePayoutPeriod(
     is_first_payout_period: bool,
     flip_on_payout_met: bool,
     flip_value: float
-) -> Tuple[float, float, bool, int, int, float, pd.DataFrame]:
+) -> Tuple[float, float, bool, int, int, float, float, pd.DataFrame]:
     """
     Simulates a payout period for a futures strategy.
 
@@ -185,6 +190,7 @@ def simulatePayoutPeriod(
                                    (excluding flip days).
             - avg_trades_per_trading_day: The average number of trades per day on
                                           actual trading days (excluding flip days).
+            - max_drawdown: The maximum drawdown experienced during the payout period.
             - df: DataFrame containing the daily results of the payout period.
 
     Raises:
@@ -209,6 +215,14 @@ def simulatePayoutPeriod(
 
     # Data tracking
     payout_period_data = []
+
+    max_drawdown = 0
+    abs_min_account_threshold = abs(min_account_threshold)  # Calculate once
+
+    if is_first_payout_period:
+        peak_account_value = abs_min_account_threshold
+    else:
+        peak_account_value = initial_account_value
 
     while not payout_complete:
         daily_profit_loss = 0
@@ -264,6 +278,18 @@ def simulatePayoutPeriod(
             )
         )
 
+        # Update peak_account_value and calculate max_drawdown
+        if is_first_payout_period:
+            adjusted_account_value = account_value + abs_min_account_threshold
+        else:
+            adjusted_account_value = account_value
+
+        # Update peak_account_value and calculate max_drawdown
+        peak_account_value = max(peak_account_value, adjusted_account_value)
+        current_drawdown = max(
+            1, (peak_account_value - adjusted_account_value) / peak_account_value)
+        max_drawdown = max(max_drawdown, current_drawdown)
+
         # Update min_account_threshold if this is the first payout period
         if is_first_payout_period and not freeze_min_account_threshold and account_value > highest_account_value:
             delta = account_value - highest_account_value
@@ -287,7 +313,7 @@ def simulatePayoutPeriod(
     # if len(df) <= 20:
     # print("\n" + df.to_string(index=False) + "\n")
 
-    return account_value, avg_trades_per_day, payout_achieved, total_trading_days, actual_trading_days, avg_trades_per_trading_day, df
+    return account_value, avg_trades_per_day, payout_achieved, total_trading_days, actual_trading_days, avg_trades_per_trading_day, max_drawdown, df
 
 
 def sampleSimulatePayoutPeriodCall():
@@ -362,7 +388,7 @@ def simulateEvaluation(
     flip_value: float,
     payouts_to_achieve: int,
     payout_amount: float
-) -> Tuple[float, int, bool, float, float, float, float, float, pd.DataFrame]:
+) -> Tuple[float, int, bool, float, float, float, float, float, float, float, pd.DataFrame]:
     """
     Simulates multiple payout periods to evaluate a trading strategy.
 
@@ -403,6 +429,7 @@ def simulateEvaluation(
             - total_amount_paid_out: The total amount paid out during the evaluation.
             - total_trading_days_all_periods: The total number of trading days across all payout periods
                                                 (including flip days, without manipulation).
+            - max_drawdown: The maximum drawdown experienced across all payout periods.
             - df_evaluation: DataFrame containing the evaluation results.
     Raises:
         ValueError: If input values are invalid (e.g., negative account values,
@@ -425,6 +452,7 @@ def simulateEvaluation(
     payout_period_tracking_data = []
     evaluation_data = []
     total_trading_days_all_periods = 0
+    evaluation_max_drawdown = 0
 
     while total_payouts < payouts_to_achieve and account_value >= min_account_threshold:
         payout_period_tracking_data.append({
@@ -442,6 +470,7 @@ def simulateEvaluation(
             pp_total_trading_days,
             pp_actual_trading_days,
             pp_avg_trades_per_trading_day,
+            pp_max_drawdown,
             _
         ) = simulatePayoutPeriod(
             trade_outcomes,
@@ -458,6 +487,7 @@ def simulateEvaluation(
         )
 
         total_trading_days_all_periods += pp_total_trading_days
+        evaluation_max_drawdown = max(evaluation_max_drawdown, pp_max_drawdown)
 
         if payout_achieved:
             if total_payouts == 0:
@@ -531,6 +561,7 @@ def simulateEvaluation(
         avg_avg_trades_per_trading_day,
         total_amount_paid_out,
         total_trading_days_all_periods,
+        evaluation_max_drawdown,
         df_evaluation
     )
 
@@ -656,6 +687,27 @@ def calculate_trade_outcomes(q1: int, q2: int, q3: int, tick_value: float) -> np
 # ]
 
 
+def constraint_func(x, accountType):
+    """
+    This function acts as a constraint for the optimizer.
+    It ensures that the sum of the first three parameters (q1, q2, q3) 
+    does not exceed the maximum number of contracts allowed for the given account type.
+
+    Args:
+        x: A list of parameter values representing a point in the search space.
+
+    Returns:
+        True if the constraint is satisfied (sum of q1, q2, q3 <= max_contracts), False otherwise.
+    """
+    q1, q2, q3, *_ = x  # Unpack the first three parameters (q1, q2, q3)
+    # Get max_contracts from account_details
+    max_contracts = account_details[accountType]['max_contracts']
+    return q1 + q2 + q3 <= max_contracts
+
+# objective_function(params)
+# optimize (partially)
+
+
 def initialize_param_space(accountType: str):
     """
     Initializes the parameter space for the trading strategy optimization based on the account type.
@@ -676,7 +728,6 @@ def initialize_param_space(accountType: str):
         - loss_multiplier: Multiplier for calculating the daily drawdown limit (float).
         - max_trades: The maximum number of trades allowed per day (integer).
         - flip_on_payout_met: Whether to apply the "flip" logic when the payout target is met within a day (boolean).
-        - constraint: A custom constraint function ensuring q1 + q2 + q3 <= max_contracts
 
     Raises:
         ValueError: If `accountType` is not "Rally" or "Grand Prix".
@@ -688,32 +739,525 @@ def initialize_param_space(accountType: str):
 
     max_contracts = account_details[accountType]['max_contracts']
 
-    # Define dimensions with the constraint
-    dimensions = [
-        Integer(0, max_contracts, name='q1'),
-        Integer(0, max_contracts, name='q2'),
-        Integer(0, max_contracts, name='q3'),
-        # Discretized using np.arange
-        Categorical(np.arange(1, 5.5, 0.5), name='win_multiplier'),
-        # Discretized using np.arange
-        Categorical(np.arange(1, 3.5, 0.5), name='loss_multiplier'),
-        Integer(1, 15, name='max_trades'),
-        Categorical([True, False], name='flip_on_payout_met'),
-    ]
-
-    # Create a custom constraint function
-    def constraint_func(x):
-        q1, q2, q3, *_ = x
-        return q1 + q2 + q3 <= max_contracts
-
-    # Add the constraint to the dimensions
-    dimensions.append(Constraint(constraint_func, name='constraint'))
-
-    # Convert dimensions to param_space format (including the constraint)
-    param_space = {dim.name: ("int" if isinstance(dim, Integer) else "float" if isinstance(
-        dim, Real) else "bool", dim.low, dim.high, dim.step if dim.step is not None else None) for dim in dimensions}
+    # Directly create param_space
+    param_space = {
+        'q1': ("int", 0, max_contracts, 1),
+        'q2': ("int", 0, max_contracts, 1),
+        'q3': ("int", 0, max_contracts, 1),
+        'win_multiplier': ("float", 1, 5.5, 0.5),  # Using np.arange for steps
+        'loss_multiplier': ("float", 1, 3.5, 0.5),  # Using np.arange for steps
+        'max_trades': ("int", 1, 15, 1),
+        'flip_on_payout_met': ("bool", True, False)
+    }
 
     return param_space
+
+
+def calculate_n_range_simulations(accountType: str):
+    """
+    Calculates a reasonable number of simulations for dynamic range calculation based on the parameter space,
+    taking into account the constraint on the sum of quantity parameters and the number of items in each category.
+
+    Args:
+        accountType: The type of account ("Rally" or "Grand Prix") to determine the parameter ranges.
+
+    Returns:
+        The calculated number of simulations for range calculation.
+    """
+    param_space = initialize_param_space(
+        accountType)  # Get the parameter space
+
+    # Define dimensions for Bayesian optimization (needed to analyze the parameter space)
+    dimensions = []
+    for key, param_settings in param_space.items():
+        # Unpack the first three elements
+        param_type, low, high = param_settings[:3]
+        # Get step if available, else None
+        step = param_settings[3] if len(param_settings) == 4 else None
+
+        if param_type == "bool":
+            dimensions.append(Categorical([True, False], name=key))
+        elif param_type == "int":
+            if step is not None:  # Check if step is provided
+                dimensions.append(Categorical(
+                    range(low, high + 1, step), name=key))
+            else:
+                dimensions.append(Integer(low, high, name=key))
+        elif param_type == "float":
+            if step is not None:
+                dimensions.append(Categorical(
+                    np.arange(low, high + step, step), name=key))
+            else:
+                dimensions.append(Real(low, high, name=key))
+
+    n_categorical_dimensions = sum(1 for dim in dimensions if isinstance(
+        dim, Categorical))  # Count Categorical dimensions
+
+    # 2. Estimate the Proportion of Feasible Combinations (using random sampling)
+    # Get max_contracts from account details
+    max_contracts = account_details[accountType]['max_contracts']
+    # Number of samples for estimating feasible proportion (adjust as needed)
+    n_samples_for_estimation = 1000
+    feasible_count = 0
+    for _ in range(n_samples_for_estimation):
+        point = [random.choice(dim.categories)
+                 for dim in dimensions]  # Generate a random point
+        if point[0] + point[1] + point[2] <= max_contracts:  # Check the constraint
+            feasible_count += 1
+    feasible_proportion = feasible_count / n_samples_for_estimation
+
+    # 3. Adjust n_range_simulations, considering the number of items in each category
+    category_sizes = [len(dim.categories)
+                      for dim in dimensions if isinstance(dim, Categorical)]
+    avg_category_size = sum(
+        category_sizes) / len(category_sizes) if category_sizes else 1  # Handle empty list
+
+    # You can adjust these factors based on your desired confidence level and computational constraints
+    base_simulations_per_dimension = 10  # Base number of simulations per dimension
+    desired_confidence_factor = 1.5  # Increase simulations for higher confidence
+
+    n_range_simulations = int(
+        (base_simulations_per_dimension * n_categorical_dimensions * desired_confidence_factor * avg_category_size) /
+        feasible_proportion
+    )
+
+    return n_range_simulations
+
+
+def generate_random_parameter_sets(param_space, n_samples, accountType):
+    """
+    Generates random parameter sets within the defined parameter space, respecting the max_contracts constraint.
+
+    Args:
+        param_space: The parameter space dictionary.
+        n_samples: The number of random parameter sets to generate
+        accountType: The type of account ("Rally" or "Grand Prix") to determine the parameter ranges.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents a parameter set.
+    """
+
+    max_contracts = account_details[accountType]['max_contracts']
+
+    def generate_valid_point():
+        """
+        Helper function to generate a single valid parameter set that satisfies the max_contracts constraint.
+        """
+        while True:
+            # Generate random values for each parameter based on its type and step size
+            point = [
+                # Handle int with step
+                random.choice(list(range(low, high + 1, step))) if param_type == "int" and step is not None else
+                random.choice(list(np.arange(low, high + step, step))) if param_type == "float" and step is not None else
+                random.randint(low, high) if param_type == "int" else
+                random.uniform(low, high) if param_type == "float" else
+                # Assuming boolean parameters have True/False as low/high
+                # Handle boolean parameters correctly
+                random.choice([low, high])
+                for _, param_settings in param_space.items()
+                # Unpack only the first 3 elements
+                for param_type, low, high in [param_settings[:3]]
+                # Extract step if available
+                for step in [param_settings[3] if len(param_settings) == 4 else None]
+            ]
+
+            # Check if the sum of q1, q2, and q3 satisfies the max_contracts constraint
+            if point[0] + point[1] + point[2] <= max_contracts:
+                return point
+
+    parameter_sets = []
+    for _ in range(n_samples):
+        # Generate a valid parameter set
+        valid_point = generate_valid_point()
+
+        # Create a dictionary mapping parameter names to their values
+        parameter_set = {param_name: x for param_name,
+                         x in zip(param_space.keys(), valid_point)}
+        parameter_sets.append(parameter_set)
+
+    return parameter_sets
+
+
+def calculate_dynamic_ranges(param_space, accountType, n_range_simulations, n_simulations_per_set, objective_weights, n_jobs, payouts_to_achieve):
+    """
+    Calculates dynamic ranges for objective values based on simulations with random parameter sets.
+
+    Args:
+        param_space: The parameter space dictionary.
+        accountType: The type of account ("Rally" or "Grand Prix").
+        n_range_simulations: The number of random parameter sets to simulate for each dynamic range set.
+        n_simulations_per_set: The number of simulations to run for each parameter set.
+        objective_weights: Dictionary specifying weights, maximization/minimization, and winsorization for each objective.
+        n_jobs: Number of parallel jobs (-1 for all cores).
+        payouts_to_achieve: The target number of successful payouts to achieve during the evaluation.
+
+    Returns:
+        A dictionary where keys are objective names and values are tuples of the format: 
+        (min_value, max_value, mean_value, std_value)
+    """
+
+    # Look up static parameters from account_details
+    initial_account_value = account_details[accountType]['initial_account_value']
+    min_account_threshold = account_details[accountType]['min_account_threshold']
+    payout_profit_target = account_details[accountType]['payout_profit_target']
+    min_trading_days = account_details[accountType]['min_trading_days']
+    flip_value = account_details[accountType]['flip_value']
+    tick_value = account_details[accountType]['tick_value']
+    payout_amount = account_details[accountType]['payout_amount']
+
+    random_parameter_sets = generate_random_parameter_sets(
+        param_space, n_range_simulations, accountType)
+
+    # Lists to store objective values from initial simulations
+    initial_final_values = []
+    initial_total_trading_days = []
+    initial_trades_per_day_values = []
+    initial_total_trading_days_per_period_values = []
+    initial_actual_trading_days_per_period_values = []
+    initial_avg_trades_per_trading_day_values = []
+    initial_total_amount_paid_out_values = []
+    initial_max_drawdown_values = []
+
+    # Pre-calculate trade_outcomes and other derived values for each parameter set
+    simulation_inputs = [
+        (
+            calculate_trade_outcomes(
+                params['q1'], params['q2'], params['q3'], tick_value),
+            params['win_multiplier'] * calculate_trade_outcomes(
+                params['q1'], params['q2'], params['q3'], tick_value)[0],
+            params['loss_multiplier'] * -calculate_trade_outcomes(
+                params['q1'], params['q2'], params['q3'], tick_value)[-1],
+            params['max_trades'],
+            params['flip_on_payout_met']
+        )
+        for params in random_parameter_sets
+    ]
+
+    # Parallelize the initial simulations
+    start_time = time.time()
+    # with Parallel(n_jobs=n_jobs) as parallel:
+    #     results = parallel(
+    #         delayed(simulateEvaluation)(
+    #             trade_outcomes=trade_outcomes,
+    #             daily_profit_target=daily_profit_target,
+    #             daily_drawdown_limit=daily_drawdown_limit,
+    #             max_trades=max_trades,
+    #             flip_on_payout_met=flip_on_payout_met,
+    #             payout_profit_target=payout_profit_target,
+    #             min_trading_days=min_trading_days,
+    #             initial_account_value=initial_account_value,
+    #             min_account_threshold=min_account_threshold,
+    #             flip_value=flip_value,
+    #             payouts_to_achieve=payouts_to_achieve,
+    #             payout_amount=payout_amount
+    #         )
+    #         for (trade_outcomes, daily_profit_target, daily_drawdown_limit, max_trades, flip_on_payout_met) in simulation_inputs
+    #     )
+
+    results = []
+    for (trade_outcomes, daily_profit_target, daily_drawdown_limit, max_trades, flip_on_payout_met) in tqdm(simulation_inputs, desc="Simulating"):
+        results.append(simulateEvaluation(
+            trade_outcomes=trade_outcomes,
+            daily_profit_target=daily_profit_target,
+            daily_drawdown_limit=daily_drawdown_limit,
+            max_trades=max_trades,
+            flip_on_payout_met=flip_on_payout_met,
+            payout_profit_target=payout_profit_target,
+            min_trading_days=min_trading_days,
+            initial_account_value=initial_account_value,
+            min_account_threshold=min_account_threshold,
+            flip_value=flip_value,
+            payouts_to_achieve=payouts_to_achieve,
+            payout_amount=payout_amount
+        ))
+
+    end_time = time.time()
+    print(
+        f"Time taken for initial simulations: {end_time - start_time:.2f} seconds")
+
+    # Extract objective values from the results
+    for (
+        final_account_value,
+        total_trading_days_all_periods,
+        avg_trades_per_day,
+        avg_total_trading_days,
+        avg_actual_trading_days,
+        avg_avg_trades_per_trading_day,
+        total_amount_paid_out,
+        max_drawdown,
+        _  # Ignore the DataFrame for now
+    ) in results:
+        initial_final_values.append(final_account_value)
+        initial_total_trading_days.append(total_trading_days_all_periods)
+        initial_trades_per_day_values.append(avg_trades_per_day)
+        initial_total_trading_days_per_period_values.append(
+            avg_total_trading_days)
+        initial_actual_trading_days_per_period_values.append(
+            avg_actual_trading_days)
+        initial_avg_trades_per_trading_day_values.append(
+            avg_avg_trades_per_trading_day)
+        initial_total_amount_paid_out_values.append(total_amount_paid_out)
+        initial_max_drawdown_values.append(max_drawdown)
+
+    # Calculate Dynamic Ranges with Winsorization and Store Mean/Std
+    dynamic_ranges = {}
+    for obj_name, obj_settings in objective_weights.items():
+        if obj_name == "avg_final_value":
+            values = initial_final_values
+        elif obj_name == "total_trading_days":
+            values = initial_total_trading_days
+        elif obj_name == "avg_trades_per_day":
+            values = initial_trades_per_day_values
+        elif obj_name == "avg_total_trading_days":
+            values = initial_total_trading_days_per_period_values
+        elif obj_name == "avg_actual_trading_days":
+            values = initial_actual_trading_days_per_period_values
+        elif obj_name == "avg_avg_trades_per_trading_day":
+            values = initial_avg_trades_per_trading_day_values
+        elif obj_name == "avg_total_amount_paid_out":
+            values = initial_total_amount_paid_out_values
+        elif obj_name == "max_drawdown":
+            values = initial_max_drawdown_values
+
+        winsorized_values = scipy.stats.mstats.winsorize(values, limits=(
+            obj_settings["lower_percentile"]/100, obj_settings["upper_percentile"]/100))
+        mean_value = np.mean(winsorized_values)
+        std_value = np.std(winsorized_values)
+        min_value = min(winsorized_values)
+        max_value = max(winsorized_values)
+
+        dynamic_ranges[obj_name] = (
+            min_value, max_value, mean_value, std_value)
+
+    return dynamic_ranges
+
+
+def generate_multiple_dynamic_ranges(
+    num_dynamic_ranges: int,
+    param_space: dict,
+    accountType: str,
+    n_simulations_per_set: int,
+    n_jobs: int,
+    payouts_to_achieve: int
+) -> List[Dict]:
+    """
+    Generates multiple sets of dynamic ranges for objective values based on simulations 
+    with random parameter sets.
+
+    Args:
+        num_dynamic_ranges: The number of dynamic range sets to generate.
+        param_space: The parameter space dictionary.
+        accountType: The type of account ("Rally" or "Grand Prix").
+        n_simulations_per_set: The number of simulations to run for each parameter set.
+        n_jobs: Number of parallel jobs (-1 for all cores).
+        payouts_to_achieve: The target number of successful payouts to achieve 
+                             during the evaluation.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents a set of 
+        dynamic ranges for the objectives.
+    """
+
+    # Create simplified objective_weights with placeholders for percentiles
+    objective_weights = {
+        "avg_final_value": {"lower_percentile": 5, "upper_percentile": 95},
+        "total_trading_days": {"lower_percentile": 25, "upper_percentile": 75},
+        "avg_trades_per_day": {"lower_percentile": 25, "upper_percentile": 75},
+        "avg_total_trading_days": {"lower_percentile": 25, "upper_percentile": 75},
+        "avg_actual_trading_days": {"lower_percentile": 25, "upper_percentile": 75},
+        "avg_avg_trades_per_trading_day": {"lower_percentile": 25, "upper_percentile": 75},
+        "avg_total_amount_paid_out": {"lower_percentile": 5, "upper_percentile": 95},
+        "max_drawdown": {"lower_percentile": 25, "upper_percentile": 75}
+    }
+
+    # Calculate n_range_simulations outside the loop
+    n_range_simulations = calculate_n_range_simulations(accountType)
+
+    # Parallelize the dynamic range calculations
+    # with Parallel(n_jobs=n_jobs) as parallel:
+    #     all_dynamic_ranges = parallel(
+    #         delayed(calculate_dynamic_ranges)(
+    #             param_space, accountType, n_range_simulations, n_simulations_per_set,
+    #             objective_weights, n_jobs, payouts_to_achieve
+    #         )
+    #         for _ in range(num_dynamic_ranges)
+    #     )
+
+    all_dynamic_ranges = []
+    for _ in tqdm(range(num_dynamic_ranges), desc="Generating Dynamic Ranges"):
+        all_dynamic_ranges.append(calculate_dynamic_ranges(
+            param_space, accountType, n_range_simulations, n_simulations_per_set,
+            objective_weights, n_jobs, payouts_to_achieve
+        ))
+
+    # Save each set of dynamic ranges to a JSON file
+    # Assuming you want to save in a "candidates" subdirectory
+    save_directory = f"dynamic_ranges/{accountType}/candidates"
+    os.makedirs(save_directory, exist_ok=True)
+
+    for i, dynamic_ranges in enumerate(all_dynamic_ranges):
+        # Sort objectives alphabetically and generate hash for filename
+        sorted_objectives = sorted(objective_weights.keys())
+        filename = hashlib.md5(
+            "_".join(sorted_objectives).encode()).hexdigest() + f"_{i}.json"
+        filepath = os.path.join(save_directory, filename)
+        with open(filepath, "w") as f:
+            json.dump(dynamic_ranges, f)
+
+    return all_dynamic_ranges
+
+
+def analyze_dynamic_ranges(account_type: str, objectives: List[str], min_max_std_threshold=0.1, mean_std_threshold=0.05):
+    """
+    Analyzes the stability of dynamic ranges loaded from JSON files,
+    creates a DataFrame with stability information, 
+    calculates weighted averages for stable ranges, and saves them to a file.
+
+    Args:
+        account_type: The type of account ("Rally" or "Grand Prix").
+        objectives: A list of objective names to analyze.
+        min_max_std_threshold: The threshold for the standard deviation of min and max values (default: 0.1).
+        mean_std_threshold: The threshold for the standard deviation of mean and std values (default: 0.05).
+
+    Returns:
+        A tuple containing:
+            - stable_ranges: A dictionary of stable ranges for each objective (if found), 
+                             or None if no stable ranges were identified.
+            - range_stats: A dictionary containing statistics (mean, std, range) for each 
+                           objective and range type across the multiple sets.
+            - df: The DataFrame containing stability information for each dynamic range set.
+    """
+
+    load_directory = f"dynamic_ranges/{account_type}/candidates"
+    filenames = [f for f in os.listdir(load_directory) if f.endswith('.json')]
+
+    data = []
+    for filename in filenames:
+        filepath = os.path.join(load_directory, filename)
+        with open(filepath, 'r') as f:
+            dynamic_ranges = json.load(f)  # Load dynamic ranges from JSON file
+
+        range_stats = {}  # Store statistics for each objective and range type
+        is_stable_overall = True
+
+        for obj_name in objectives:
+            min_val, max_val, mean_value, std_value = dynamic_ranges[obj_name]
+
+            # Calculate standard deviations for min, max, mean, and std values
+            range_stats[obj_name] = {
+                'min_std': np.std([min_val]),
+                'max_std': np.std([max_val]),
+                'mean_std': np.std([mean_value]),
+                'std_std': np.std([std_value])
+            }
+
+            # Check stability using the provided thresholds
+            is_stable = all([
+                range_stats[obj_name]['min_std'] < min_max_std_threshold,
+                range_stats[obj_name]['max_std'] < min_max_std_threshold,
+                range_stats[obj_name]['mean_std'] < mean_std_threshold,
+                range_stats[obj_name]['std_std'] < mean_std_threshold
+            ])
+
+            is_stable_overall &= is_stable  # Update overall stability
+
+        # Create a row for the DataFrame
+        row = {'guid': filename.replace(".json", "")}
+        for obj_name in objectives:
+            for stat_name, stat_value in range_stats[obj_name].items():
+                row[f"{obj_name}_{stat_name}"] = stat_value
+        row['stable'] = is_stable_overall
+
+        data.append(row)
+
+    df = pd.DataFrame(data)
+
+    # Calculate weighted averages for stable ranges
+    stable_ranges = {}
+    if df['stable'].any():  # Check if there are any stable range sets
+        for obj_name in objectives:
+            stable_df = df[df['stable']]
+
+            # Weights based on inverse of standard deviation (lower std -> higher weight)
+            weights = 1 / (stable_df[f"{obj_name}_min_std"] + stable_df[f"{obj_name}_max_std"]
+                           + stable_df[f"{obj_name}_mean_std"] + stable_df[f"{obj_name}_std_std"])
+
+            # Calculate weighted averages
+            stable_ranges[obj_name] = (
+                np.average(stable_df[f"{obj_name}_min"], weights=weights),
+                np.average(stable_df[f"{obj_name}_max"], weights=weights),
+                np.average(
+                    stable_df[f"{obj_name}_mean_mean"], weights=weights),
+                np.average(stable_df[f"{obj_name}_std_mean"], weights=weights)
+            )
+
+        # Save stable_ranges to a file
+        save_directory = f"dynamic_ranges/{account_type}"
+        os.makedirs(save_directory, exist_ok=True)
+
+        # Sort objectives alphabetically and generate hash for filename
+        sorted_objectives = sorted(objectives)
+        filename = hashlib.md5(
+            "_".join(sorted_objectives).encode()).hexdigest() + ".json"
+        filepath = os.path.join(save_directory, filename)
+        with open(filepath, "w") as f:
+            json.dump(stable_ranges, f)
+
+    return stable_ranges, range_stats, df
+
+
+def generate_and_analyze_dynamic_ranges(account_type: str, num_dynamic_ranges: int = 20, n_simulations_per_set: int = 10, n_jobs: int = -1, payouts_to_achieve: int = 3):
+    """
+    Generates and analyzes multiple sets of dynamic ranges for the specified account type.
+
+    Args:
+        account_type: The type of account ("Rally" or "Grand Prix").
+        num_dynamic_ranges: The number of dynamic range sets to generate (default: 20).
+        n_simulations_per_set: The number of simulations to run for each parameter set (default: 10).
+        n_jobs: Number of parallel jobs (-1 for all cores, default: -1).
+        payouts_to_achieve: The target number of successful payouts to achieve during the evaluation (default 3).
+
+    Returns:
+        A tuple containing:
+            - stable_ranges: A dictionary of stable ranges for each objective (if found), or None if no stable ranges were identified.
+            - range_stats: A dictionary containing statistics (mean, std, range) for each objective and range type across the multiple sets.
+            - df_analysis: The DataFrame containing stability information for each dynamic range set.
+    """
+
+    # Get the param_space
+    param_space = initialize_param_space(account_type)
+
+    # Generate multiple dynamic ranges
+    generate_multiple_dynamic_ranges(
+        num_dynamic_ranges,
+        param_space,
+        account_type,
+        n_simulations_per_set,
+        n_jobs,
+        payouts_to_achieve
+    )
+
+    # Analyze the generated dynamic ranges
+    stable_ranges, range_stats, df_analysis = analyze_dynamic_ranges(
+        account_type, list(objective_weights.keys()))
+
+    # Print or display the results (you can customize this based on your needs)
+    print(df_analysis)
+
+    if stable_ranges:
+        print("\nStable Ranges Found:")
+        for obj_name, ranges in stable_ranges.items():
+            print(f"{obj_name}: {ranges}")
+    else:
+        print("\nNo Stable Ranges Found.")
+
+    return stable_ranges, range_stats, df_analysis
+
+
+stable_ranges, range_stats, df_analysis = generate_and_analyze_dynamic_ranges(
+    account_type="Grand Prix",
+    num_dynamic_ranges=50,
+    payouts_to_achieve=6)  # Or "Rally"
 
 
 def optimize(
@@ -732,7 +1276,8 @@ def optimize(
     """
     Optimizes trading strategy parameters using nested Monte Carlo simulations and Bayesian optimization.
 
-    Args:accountType: Account type to look up static parameters.
+    Args:
+        accountType: Account type to look up static parameters.
         payouts_to_achieve: Target number of successful payouts.
         success_probability_threshold: Minimum probability of success (default: 0.8).
         objective_weights: Dictionary specifying weights, maximization/minimization, and winsorization for each objective.
@@ -758,21 +1303,35 @@ def optimize(
     elif sum(obj["weight"] for obj in objective_weights.values()) != 1.0:
         raise ValueError("The sum of weights in objective_weights must be 1.0")
 
-    all_final_values = []
-    all_total_trading_days = []
-    avg_trades_per_day_values = []
-    total_trading_days_per_period_values = []
-    actual_trading_days_per_period_values = []
-    avg_avg_trades_per_trading_day_values = []
-    total_amount_paid_out_values = []
-    final_values = []  # Declare final_values in the outer scope
+    # 2. Load or Calculate Dynamic Ranges
+    save_directory = f"dynamic_ranges/{accountType}"
+
+    # Sort objectives alphabetically and generate hash for filename
+    sorted_objectives = sorted(objective_weights.keys())
+    filename = hashlib.md5(
+        "_".join(sorted_objectives).encode()).hexdigest() + ".json"
+    filepath = os.path.join(save_directory, filename)
+
+    if os.path.exists(filepath):
+        # Load dynamic ranges from file
+        with open(filepath, 'r') as f:
+            dynamic_ranges = json.load(f)
+        print(f"Loaded dynamic ranges from {filepath}")
+    else:
+        raise FileNotFoundError(
+            f"No pre-calculated dynamic ranges found for objectives: {sorted_objectives} in {save_directory}.")
 
     # Initialize the parameter space based on the account type (moved inside optimize)
     param_space = initialize_param_space(accountType)
 
     # Define dimensions for Bayesian optimization
     dimensions = []
-    for key, (param_type, low, high, step) in param_space.items():
+    for key, param_settings in param_space.items():
+        # Unpack the first three elements
+        param_type, low, high = param_settings[:3]
+        # Get step if available, else None
+        step = param_settings[3] if len(param_settings) == 4 else None
+
         if param_type == "bool":
             dimensions.append(Categorical([True, False], name=key))
         elif param_type == "int":
@@ -797,24 +1356,16 @@ def optimize(
     tick_value = account_details[accountType]['tick_value']
     payout_amount = account_details[accountType]['payout_amount']
 
-    # Objective function to be optimized
-    @ use_named_args(dimensions=dimensions)
-    def objective_function(**params):
+    @use_named_args(dimensions=dimensions)
+    def objective_function(params):
         """
         Objective function to be optimized. It calculates various metrics for a given set of parameters.
 
         Args:
-            **params: A dictionary of parameters to be evaluated.
+            params: A dictionary of parameters to be evaluated.
 
         Returns:
-            A tuple containing the calculated metrics:
-                - avg_final_value
-                - avg_total_trading_days_all_periods
-                - avg_trades_per_day
-                - avg_total_trading_days
-                - avg_actual_trading_days
-                - avg_avg_trades_per_trading_day
-                - avg_total_amount_paid_out
+            The combined score (a single scalar value) after normalization and weighting.
         """
 
         # Calculate trade_outcomes based on the optimized parameters and tick_value
@@ -833,7 +1384,7 @@ def optimize(
         flip_on_payout_met = params['flip_on_payout_met']
 
         # Run multiple evaluations with the same parameters to get an average
-        nonlocal final_values
+        # Declare and reset lists for each optimization run
         final_values = []
         total_trading_days_values = []
         trades_per_day_values = []
@@ -841,158 +1392,144 @@ def optimize(
         actual_trading_days_per_period_values = []
         avg_trades_per_trading_day_values = []
         total_amount_paid_out_values = []
+        max_drawdown_values = []
 
         # Inner loop for Monte Carlo simulations
-        for _ in tqdm(range(num_simulations), desc="Running simulations", leave=False):
-            # Simulate the evaluation and collect results
-            (
-                final_account_value,
-                total_payouts,
-                evaluation_succeeded,
-                avg_trades_per_day,
-                avg_total_trading_days,
-                avg_actual_trading_days,
-                avg_avg_trades_per_trading_day,
-                total_amount_paid_out,
-                total_trading_days_all_periods,
-                _  # Ignore the DataFrame for now
-            ) = simulateEvaluation(
-                trade_outcomes,
-                daily_profit_target,
-                payout_profit_target,
-                min_trading_days,
-                initial_account_value,
-                min_account_threshold,
-                max_trades,
-                daily_drawdown_limit,
-                flip_on_payout_met,
-                flip_value,
-                payouts_to_achieve,
-                payout_amount
+        with Parallel(n_jobs=n_jobs) as parallel:
+            results = parallel(
+                delayed(simulateEvaluation)(
+                    trade_outcomes,
+                    daily_profit_target,
+                    payout_profit_target,
+                    min_trading_days,
+                    initial_account_value,
+                    min_account_threshold,
+                    max_trades,
+                    daily_drawdown_limit,
+                    flip_on_payout_met,
+                    flip_value,
+                    payouts_to_achieve,
+                    payout_amount
+                )
+                for _ in range(num_simulations)
             )
 
-            # Only consider successful evaluations
-            if evaluation_succeeded:
-                final_values.append(final_account_value)
-                total_trading_days_values.append(
-                    total_trading_days_all_periods)
-                trades_per_day_values.append(avg_trades_per_day)
-                total_trading_days_per_period_values.append(
-                    avg_total_trading_days)
-                actual_trading_days_per_period_values.append(
-                    avg_actual_trading_days)
-                avg_trades_per_trading_day_values.append(
-                    avg_avg_trades_per_trading_day)
-                total_amount_paid_out_values.append(total_amount_paid_out)
+        # Extract objective values from the results
+        for (
+            final_account_value,
+            total_trading_days_all_periods,
+            result_avg_trades_per_day,  # Renamed
+            result_avg_total_trading_days,  # Renamed
+            result_avg_actual_trading_days,  # Renamed
+            result_avg_avg_trades_per_trading_day,  # Renamed
+            total_amount_paid_out,
+            max_drawdown,
+            _  # Ignore the DataFrame for now
+        ) in results:
+            final_values.append(final_account_value)
+            total_trading_days_values.append(total_trading_days_all_periods)
+            trades_per_day_values.append(
+                result_avg_trades_per_day)  # Use renamed variable
+            total_trading_days_per_period_values.append(
+                result_avg_total_trading_days)  # Use renamed variable
+            actual_trading_days_per_period_values.append(
+                result_avg_actual_trading_days)  # Use renamed variable
+            avg_trades_per_trading_day_values.append(
+                result_avg_avg_trades_per_trading_day)  # Use renamed variable
+            total_amount_paid_out_values.append(total_amount_paid_out)
+            max_drawdown_values.append(max_drawdown)
 
-        # Calculate averages only if there were successful evaluations
-        if final_values:
-            avg_final_value = sum(final_values) / len(final_values)
-            avg_total_trading_days_all_periods = sum(
-                total_trading_days_values) / len(total_trading_days_values)
-            avg_trades_per_day = sum(
-                trades_per_day_values) / len(trades_per_day_values)
-            avg_total_trading_days = sum(
-                total_trading_days_per_period_values) / len(total_trading_days_per_period_values)
-            avg_actual_trading_days = sum(
-                actual_trading_days_per_period_values) / len(actual_trading_days_per_period_values)
-            avg_avg_trades_per_trading_day = sum(
-                avg_trades_per_trading_day_values) / len(avg_avg_trades_per_trading_day_values)
-            avg_total_amount_paid_out = sum(
-                total_amount_paid_out_values) / len(total_amount_paid_out_values)
-        else:
-            # Penalize parameter sets that didn't succeed in any simulations
-            avg_final_value = - \
-                float('inf') if objective_weights["avg_final_value"]["maximize"] else float(
-                    'inf')
-            avg_total_trading_days_all_periods = float(
-                'inf') if objective_weights["total_trading_days"]["maximize"] else -float('inf')
-            avg_trades_per_day = float('inf') if objective_weights.get(
-                "avg_trades_per_day", {}).get("maximize", False) else -float('inf')
-            avg_total_trading_days = float('inf') if objective_weights.get(
-                "avg_total_trading_days", {}).get("maximize", False) else -float('inf')
-            avg_actual_trading_days = float('inf') if objective_weights.get(
-                "avg_actual_trading_days", {}).get("maximize", False) else -float('inf')
-            avg_avg_trades_per_trading_day = float('inf') if objective_weights.get(
-                "avg_avg_trades_per_trading_day", {}).get("maximize", False) else -float('inf')
-            avg_total_amount_paid_out = -float('inf') if objective_weights.get(
-                "avg_total_amount_paid_out", {}).get("maximize", False) else float('inf')
-
-        all_final_values.extend(final_values)
-        all_total_trading_days.extend(total_trading_days_values)
-        avg_trades_per_day_values.extend(trades_per_day_values)
-        total_trading_days_per_period_values.extend(
-            total_trading_days_per_period_values)
-        actual_trading_days_per_period_values.extend(
+        # Calculate averages
+        avg_final_value = np.mean(final_values)
+        avg_total_trading_days_all_periods = np.mean(total_trading_days_values)
+        avg_trades_per_day = np.mean(trades_per_day_values)
+        avg_total_trading_days = np.mean(total_trading_days_per_period_values)
+        avg_actual_trading_days = np.mean(
             actual_trading_days_per_period_values)
-        avg_avg_trades_per_trading_day_values.extend(
-            avg_avg_trades_per_trading_day_values)
-        total_amount_paid_out_values.extend(total_amount_paid_out_values)
+        avg_avg_trades_per_trading_day = np.mean(
+            avg_trades_per_trading_day_values)
+        avg_total_amount_paid_out = np.mean(total_amount_paid_out_values)
+        avg_max_drawdown = np.mean(max_drawdown_values)
 
-        # Return all the objective values
-        return avg_final_value, avg_total_trading_days_all_periods, avg_trades_per_day, avg_total_trading_days, avg_actual_trading_days, avg_avg_trades_per_trading_day, avg_total_amount_paid_out
+        # Normalize and standardize the calculated average objective values
+        normalized_objectives = []
+        objective_values = [avg_final_value, avg_total_trading_days_all_periods,
+                            avg_trades_per_day, avg_total_trading_days,
+                            avg_actual_trading_days, avg_avg_trades_per_trading_day,
+                            avg_total_amount_paid_out, avg_max_drawdown]
+
+        for i, obj_name in enumerate(objective_weights):
+            value = objective_values[i]  # Use the calculated average value
+            min_val, max_val, mean_value, std_value = dynamic_ranges[obj_name]
+
+            # Normalize to 0-1 range using dynamic_ranges (avoid division by zero)
+            if max_val - min_val != 0:
+                normalized_value = (value - min_val) / (max_val - min_val)
+            else:
+                normalized_value = 0  # Or some other appropriate handling for zero range
+
+            # Standardize
+            normalized_value = (normalized_value - mean_value) / std_value
+
+            normalized_objectives.append(normalized_value)
+
+        # Calculate the combined score based on weights and maximization/minimization settings
+        combined_score = 0
+        for i, obj_name in enumerate(objective_weights):
+            value = normalized_objectives[i]
+            weight = objective_weights[obj_name]["weight"]
+            maximize = objective_weights[obj_name]["maximize"]
+            combined_score += weight * (value if maximize else -value)
+
+        # Return the combined score (for the optimizer)
+        return combined_score
+
+    # Create a closure to capture accountType
+    def constraint_func_with_account_type(x):
+        return constraint_func(x, accountType)
 
     # Create the optimizer object
     opt = Optimizer(
         dimensions=dimensions,
         acq_func=acq_func,
         n_initial_points=n_random_starts,
+        space_constraint=constraint_func_with_account_type
     )
 
     # Run the optimization loop with outer progress bar
+    combined_scores = []
     for _ in tqdm(range(n_calls), desc="Optimization Progress"):
         next_params = opt.ask()
-        result = objective_function(
-            **{dim.name: val for dim, val in zip(opt.space.dimensions, next_params)})
-        opt.tell(next_params, result)
+        combined_score = objective_function(
+            params={dim.name: val for dim, val in zip(opt.space.dimensions, next_params)})
 
-    # Winsorize and standardize objective values across all simulations
-    objective_values = {
-        "avg_final_value": all_final_values,
-        "total_trading_days": all_total_trading_days,
-        "avg_trades_per_day": avg_trades_per_day_values,
-        "avg_total_trading_days": total_trading_days_per_period_values,
-        "avg_actual_trading_days": actual_trading_days_per_period_values,
-        "avg_avg_trades_per_trading_day": avg_avg_trades_per_trading_day_values,
-        "avg_total_amount_paid_out": total_amount_paid_out_values
-    }
+        # Pass the combined score to opt.tell
+        opt.tell(next_params, combined_score)
+        combined_scores.append(combined_score)  # Store the combined score
 
-    normalized_objective_values = {}
-
-    for obj_name, obj_settings in objective_weights.items():
-        values = objective_values[obj_name]
-
-        winsorized_values = scipy.stats.mstats.winsorize(values, limits=(
-            obj_settings["lower_percentile"]/100, obj_settings["upper_percentile"]/100))
-        mean_value = np.mean(winsorized_values)
-        std_value = np.std(winsorized_values)
-
-        normalized_values = [(v - mean_value) / std_value for v in values]
-        normalized_objective_values[obj_name] = normalized_values
-
-        # Store the mean and standard deviation for each objective
-        if obj_name == "avg_final_value":
-            mean_final_value, std_final_value = mean_value, std_value
-        elif obj_name == "total_trading_days":
-            mean_total_trading_days, std_total_trading_days = mean_value, std_value
-        elif obj_name == "avg_trades_per_day":
-            mean_avg_trades_per_day, std_avg_trades_per_day = mean_value, std_value
-        elif obj_name == "avg_total_trading_days":
-            mean_avg_total_trading_days, std_avg_total_trading_days = mean_value, std_value
-        elif obj_name == "avg_actual_trading_days":
-            mean_avg_actual_trading_days, std_avg_actual_trading_days = mean_value, std_value
-        elif obj_name == "avg_avg_trades_per_trading_day":
-            mean_avg_avg_trades_per_trading_day, std_avg_avg_trades_per_trading_day = mean_value, std_value
-        elif obj_name == "avg_total_amount_paid_out":
-            mean_avg_total_amount_paid_out, std_avg_total_amount_paid_out = mean_value, std_value
-
-    # Get top N results from the optimizer
+    # Get top N results from the optimizer (using combined_scores)
     top_results = []
-    for i, (point, value) in enumerate(zip(opt.Xi, opt.yi)):
+    for i, (point, _) in enumerate(zip(opt.Xi, opt.yi)):
         params = {dim.name: x for dim, x in zip(opt.space.dimensions, point)}
 
-        normalized_objectives = {
-            obj_name: normalized_objective_values[obj_name][i] for obj_name in objective_weights}
+        # Denormalize the objective values for reporting
+        denormalized_objectives = []
+        for j, obj_name in enumerate(objective_weights):
+            # Get the combined score for this evaluation
+            normalized_value = opt.yi[i]
+            min_val, max_val, mean_value, std_value = dynamic_ranges[obj_name]
+
+            # Reverse the standardization
+            denormalized_value = normalized_value * std_value + mean_value
+
+            # Reverse the 0-1 normalization (avoid multiplication by zero)
+            if max_val - min_val != 0:
+                denormalized_value = denormalized_value * \
+                    (max_val - min_val) + min_val
+            else:
+                denormalized_value = min_val  # Or some other appropriate handling for zero range
+
+            denormalized_objectives.append(denormalized_value)
 
         # Recalculate trade_outcomes using the current params and tick_value
         trade_outcomes = calculate_trade_outcomes(
@@ -1001,45 +1538,21 @@ def optimize(
 
         # Include all objectives and trade_outcomes in top_results
         top_results.append(
-            (params, *[normalized_objectives[obj_name]
-             for obj_name in objective_weights], trade_outcomes)
+            (params, *denormalized_objectives,
+             trade_outcomes, combined_scores[i])
         )
 
-    # Sort by weighted objective, considering maximization/minimization settings
-    top_results = sorted(
-        top_results,
-        key=lambda x: sum(
-            objective_weights[obj_name]["weight"] *
-            (x[i+1] if objective_weights[obj_name]["maximize"] else -x[i+1])
-            for i, obj_name in enumerate(objective_weights)
-        ),
-        reverse=True,
-    )[:top_n_results]
+    # Sort by combined_score (descending order)
+    top_results.sort(key=lambda x: x[-1], reverse=True)
 
-    # Denormalize values for the top results
-    for i, obj_name in enumerate(objective_weights):
-        if obj_name == "avg_final_value":
-            mean_value, std_value = mean_final_value, std_final_value
-        elif obj_name == "total_trading_days":
-            mean_value, std_value = mean_total_trading_days, std_total_trading_days
-        elif obj_name == "avg_trades_per_day":
-            mean_value, std_value = mean_avg_trades_per_day, std_avg_trades_per_day
-        elif obj_name == "avg_total_trading_days":
-            mean_value, std_value = mean_avg_total_trading_days, std_avg_total_trading_days
-        elif obj_name == "avg_actual_trading_days":
-            mean_value, std_value = mean_avg_actual_trading_days, std_avg_actual_trading_days
-        elif obj_name == "avg_avg_trades_per_trading_day":
-            mean_value, std_value = mean_avg_avg_trades_per_trading_day, std_avg_avg_trades_per_trading_day
-        elif obj_name == "avg_total_amount_paid_out":
-            mean_value, std_value = mean_avg_total_amount_paid_out, std_avg_total_amount_paid_out
-        else:
-            # Handle other objectives if you add them in the future
-            continue
+    # Filter based on success probability
+    filtered_results = [
+        result for result in top_results
+        if sum(simulateEvaluation(*result[0:12])[2] for _ in range(num_simulations)) / num_simulations >= success_probability_threshold
+    ]
 
-        for result in top_results:
-            result[i+1] = result[i+1] * std_value + mean_value
-
-    return top_results, param_space
+    # Return top N filtered results
+    return filtered_results[:top_n_results], param_space
 
 
 def run_optimization(
@@ -1208,15 +1721,15 @@ objective_weights = {
     "total_trading_days": {"weight": 0.3, "maximize": False, "lower_percentile": 5, "upper_percentile": 95}
 }
 
-run_optimization(
-    account_type="Grand Prix",  # Or "Grand Prix" depending on your test case
-    payouts_to_achieve=3,  # Reduced for faster evaluation
-    success_probability_threshold=0.2,  # Lowered for quicker results
-    objective_weights=objective_weights,
-    num_simulations=50,     # Reduced for faster simulations
-    n_calls=20,             # Reduced for fewer optimization iterations
-    n_random_starts=5       # Reduced for fewer initial random points
-)
+# run_optimization(
+#     account_type="Grand Prix",  # Or "Grand Prix" depending on your test case
+#     payouts_to_achieve=3,  # Reduced for faster evaluation
+#     success_probability_threshold=0.2,  # Lowered for quicker results
+#     objective_weights=objective_weights,
+#     num_simulations=50,     # Reduced for faster simulations
+#     n_calls=20,             # Reduced for fewer optimization iterations
+#     n_random_starts=5       # Reduced for fewer initial random points
+# )
 
 # region
 # def display_results(top_results):
